@@ -142,6 +142,18 @@ def collect_time_series_paths_and_extra(messages: list[dict]):
     )
 
 
+def collect_time_series_forecast_target_paths(messages: list[dict]):
+    target_paths = []
+    for msg in messages:
+        if msg["role"] == "assistant" and isinstance(msg["content"], dict):
+            if msg["content"]["type"] == "time_series_forecast_target_url":
+                target_paths.append(msg["content"]["time_series_forecast_target_url"])
+                msg["content"] = msg["content"].get("feedback_when_forecasting_disabled", "")
+
+    assert len(target_paths) <= 1
+    return target_paths
+
+
 def load_image(image_path: str):
     return Image.open(image_path).convert("RGB")
 
@@ -235,6 +247,8 @@ class BaseMLLMTokenizeFunction(CachableTokenizeFunction[T]):
 
             self._time_series_path, time_series_extra_info = collect_time_series_paths_and_extra(item["messages"])
             self._time_series_sampling_rate = time_series_extra_info["sampling_rate"]
+
+            self._time_series_forecast_target_path = collect_time_series_forecast_target_paths(item["messages"])
 
         except RuntimeError as e:
             if self.state == "cache":

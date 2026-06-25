@@ -184,6 +184,8 @@ class Qwen3VLTextMoE(Qwen3MoE):
                 output["hidden_states"].append(hidden_states)
 
         hidden_states = self.norm(hidden_states)
+        if self.config.return_hidden_states:
+            output["hidden_states"][-1] = hidden_states
 
         # Get LM loss context from dict
         lm_loss_ctx = loss_ctx["lm"] if loss_ctx is not None else None

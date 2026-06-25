@@ -28,6 +28,7 @@ class QwenVL3DataItem(BaseMLLMDataItem, total=False):
     time_series_signals: torch.Tensor
     ts_len: torch.Tensor
     ts_sr: torch.Tensor
+    ts_forecast_target_signals: torch.Tensor
 
 
 class OmniDataItem(BaseMLLMDataItem, total=False):

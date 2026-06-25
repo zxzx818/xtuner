@@ -79,8 +79,8 @@ class PresetPackDataset(tud.Dataset):
         datasets: list[JsonlDataset],
         pack_config_path: str,
         pack_max_length: int,
-        short_pack_strategy: Literal["error", "padding"] = "error",
-        long_pack_strategy: Literal["error", "truncate"] = "error",
+        short_pack_strategy: Literal["error", "padding", "no_op"] = "error",
+        long_pack_strategy: Literal["error", "truncate", "no_op"] = "error",
         mmap: bool = True,
     ) -> None:
         super().__init__()
@@ -241,11 +241,9 @@ class PresetPackDataset(tud.Dataset):
                 if self.long_pack_strategy == "truncate":
                     remaining = self.pack_max_length - running_tokens
                     tok_end = min(tok_end, tok_off + remaining)
-                item = {
-                    "input_ids": item["input_ids"][tok_off:tok_end],
-                    "labels": item["labels"][tok_off:tok_end],
-                    "num_tokens": tok_end - tok_off,
-                }
+                item["input_ids"] = item["input_ids"][tok_off:tok_end]
+                item["labels"] = item["labels"][tok_off:tok_end]
+                item["num_tokens"] = tok_end - tok_off
             else:
                 long_item = cast(LongTextDataItem, item)
                 if (

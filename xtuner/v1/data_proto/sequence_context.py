@@ -58,7 +58,11 @@ class SequenceContext:
     # time series
     time_series_signals: list[torch.FloatTensor] | torch.FloatTensor | None = None
     ts_lens: torch.Tensor | None = None
+    ts_channels: torch.Tensor | None = None
     ts_sr: torch.Tensor | None = None
+    # time series forecast
+    ts_forecast_target_signals: list[torch.Tensor] | None = None
+    ts_forecast_input_id_ends: torch.Tensor | None = None
 
     def __init__(
         self,
@@ -87,15 +91,23 @@ class SequenceContext:
         shard_start: int = 0,
         shard_size: int = 0,
         # time series
-        time_series_signals: torch.FloatTensor | None = None,
+        time_series_signals: list[torch.FloatTensor] | torch.FloatTensor | None = None,
         ts_lens: torch.Tensor | None = None,
+        ts_channels: torch.Tensor | None = None,
         ts_sr: torch.Tensor | None = None,
+        # time series forecast
+        ts_forecast_target_signals: list[torch.Tensor] | None = None,
+        ts_forecast_input_id_ends: torch.Tensor | None = None,
     ):
         # Only to distinguish parameters accepted by the constructor from attributes. For example, for `max_length_q`,
         # the argument can be an int, but as an attribute it can only be a tensor
         self.time_series_signals = time_series_signals
         self.ts_lens = ts_lens
+        self.ts_channels = ts_channels
         self.ts_sr = ts_sr
+
+        self.ts_forecast_target_signals = ts_forecast_target_signals
+        self.ts_forecast_input_id_ends = ts_forecast_input_id_ends
 
         self.input_ids = input_ids
         self.cu_seq_lens_q = cu_seq_lens_q
@@ -236,6 +248,12 @@ class SequenceContext:
                 raw_input_ids=cast(torch.LongTensor, pad_input_ids),
                 shard_start=start,
                 shard_size=shard_size,
+                time_series_signals=self.time_series_signals,
+                ts_lens=self.ts_lens,
+                ts_channels=self.ts_channels,
+                ts_sr=self.ts_sr,
+                ts_forecast_target_signals=self.ts_forecast_target_signals,
+                ts_forecast_input_id_ends=self.ts_forecast_input_id_ends,
             )
             return sp_seq_ctx
         else:
@@ -474,6 +492,12 @@ class SequenceContext:
             raw_inputs_embeds=overrides.get("raw_inputs_embeds", self._raw_inputs_embeds),
             shard_start=overrides.get("shard_start", self._shard_start),
             shard_size=overrides.get("shard_size", self._shard_size),
+            time_series_signals=overrides.get("time_series_signals", self.time_series_signals),
+            ts_lens=overrides.get("ts_lens", self.ts_lens),
+            ts_channels=overrides.get("ts_channels", self.ts_channels),
+            ts_sr=overrides.get("ts_sr", self.ts_sr),
+            ts_forecast_target_signals=overrides.get("ts_forecast_target_signals", self.ts_forecast_target_signals),
+            ts_forecast_input_id_ends=overrides.get("ts_forecast_input_id_ends", self.ts_forecast_input_id_ends),
         )
 
     def to(self, device: torch.device | str):
@@ -518,8 +542,18 @@ class SequenceContext:
                 self.time_series_signals = self.time_series_signals.to(device)  # type: ignore
         if self.ts_lens is not None and hasattr(self.ts_lens, "to"):
             self.ts_lens = self.ts_lens.to(device)  # type: ignore
+        if self.ts_channels is not None and hasattr(self.ts_channels, "to"):
+            self.ts_channels = self.ts_channels.to(device)  # type: ignore
         if self.ts_sr is not None and hasattr(self.ts_sr, "to"):
             self.ts_sr = self.ts_sr.to(device)  # type: ignore
+
+        if self.ts_forecast_target_signals is not None:
+            if isinstance(self.ts_forecast_target_signals, list):
+                self.ts_forecast_target_signals = [ts.to(device) for ts in self.ts_forecast_target_signals]  # type: ignore
+            else:
+                self.ts_forecast_target_signals = self.ts_forecast_target_signals.to(device)  # type: ignore
+        if self.ts_forecast_input_id_ends is not None and hasattr(self.ts_forecast_input_id_ends, "to"):
+            self.ts_forecast_input_id_ends = self.ts_forecast_input_id_ends.to(device)  # type: ignore
 
         self.device = device
 

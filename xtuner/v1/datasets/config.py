@@ -312,6 +312,14 @@ class DataloaderConfig(BaseDataloaderConfig):
         Parameter(help="path to sampler order .npy (mmap read); required when pack_level='preset'"),
     ] = None
     round_up: Annotated[bool, Parameter(help="enable or disable round up mode")] = True
+    short_pack_strategy: Annotated[
+        Literal["error", "padding", "no_op"],
+        Parameter(help='What to do when a pack has fewer tokens than ``pack_max_length``. ``"error"`` raises; ``"padding"`` appends pad tokens.'),
+    ] = "error"
+    long_pack_strategy: Annotated[
+        Literal["error", "truncate", "no_op"],
+        Parameter(help='What to do when a pack has more tokens than ``pack_max_length``. ``"error"`` raises; ``"truncate"`` truncates at pack_max_length during ``__getitem__``.'),
+    ] = "error"
 
     @staticmethod
     def _force_preset_pack_settings(dataset_config_list: "DatasetConfigList") -> "DatasetConfigList":
@@ -464,6 +472,8 @@ class DataloaderConfig(BaseDataloaderConfig):
                     datasets,
                     pack_config_path=self.pack_config_path,
                     pack_max_length=self.pack_max_length,
+                    short_pack_strategy=self.short_pack_strategy,
+                    long_pack_strategy=self.long_pack_strategy,
                 )
             else:
                 raise NotImplementedError(f"Unsupported pack level: {self.pack_level}")

@@ -65,11 +65,13 @@ class BaseComposeModel(BaseModel):
         self.multi_modal_projector = config.projector_config.build()
         self.language_model = config.text_config.build()
 
-        self.time_series = None
+        self.time_series, self.time_series_forecaster = None, None
         if config.time_series_encoder_path is not None:
             from .qwen3_vl.modeling_ts import Qwen3VLTimeSeriesModel
 
             self.time_series = Qwen3VLTimeSeriesModel(config.time_series_encoder_path)
+        if config.enable_ts_forecast:
+            self.time_series_forecaster = config.time_series_forecaster_config.build()
 
         self._maybe_enable_compile(self.compile_cfg)
         self._freeze_modules()
@@ -96,6 +98,10 @@ class BaseComposeModel(BaseModel):
         self.vision_tower.init_weights()
         self.language_model.init_weights()
         self.multi_modal_projector.init_weights()
+        if self.time_series is not None:
+            self.time_series.init_weights()
+        if self.time_series_forecaster is not None:
+            self.time_series_forecaster.init_weights()
 
     def fully_shard(
         self,
@@ -108,6 +114,8 @@ class BaseComposeModel(BaseModel):
 
         if self.time_series is not None:
             self.time_series.fully_shard(self.fsdp_config)
+        if self.time_series_forecaster is not None:
+            self.time_series_forecaster.fully_shard(self.fsdp_config)
 
         mp_policy = MixedPrecisionPolicy(param_dtype=fsdp_config.param_dtype, reduce_dtype=fsdp_config.reduce_dtype)
 
@@ -141,15 +149,17 @@ class BaseComposeModel(BaseModel):
         if isinstance(hf_path, Path):
             hf_path = str(hf_path)
 
-        missing_ts_keys = set()
+        missing_ts_keys, missing_ts_forecaster_keys = set(), set()
         if self.time_series is not None:
             _, _, missing_ts_keys = self.time_series.from_hf(hf_path, strict=False)
+        if self.time_series_forecaster is not None:
+            _, _, missing_ts_forecaster_keys = self.time_series_forecaster.from_hf(hf_path, strict=False)
 
         _, _, missing_llm_keys = self.language_model.from_hf(hf_path, strict=False)
         _, _, missing_vision_keys = self.vision_tower.from_hf(hf_path, strict=False)
         _, _, missing_project_keys = self.multi_modal_projector.from_hf(hf_path, strict=False)
 
-        missing = missing_llm_keys | missing_vision_keys | missing_project_keys | missing_ts_keys
+        missing = missing_llm_keys | missing_vision_keys | missing_project_keys | missing_ts_keys | missing_ts_forecaster_keys
         if strict:
             if missing:
                 raise RuntimeError(f"Missing parameters from {hf_path}: {list(missing)}. ")
@@ -169,6 +179,9 @@ class BaseComposeModel(BaseModel):
 
         if self.time_series is not None:
             self.time_series.save_hf(hf_dir, save_dtype, "model-time_series")
+            update_weight_map_from_safetensors_index(weight_map_dict, hf_dir)
+        if self.time_series_forecaster is not None:
+            self.time_series_forecaster.save_hf(hf_dir, save_dtype, "model-time_series_forecaster")
             update_weight_map_from_safetensors_index(weight_map_dict, hf_dir)
 
         if dist.get_rank() == 0:

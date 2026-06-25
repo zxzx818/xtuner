@@ -23,6 +23,12 @@ QWEN3VL_COMPILE_CFG: dict[str, TorchCompileOption] = {
 }
 
 
+class Qwen3VLForConditionalGenerationModelOutputs(MoEModelOutputs):
+    point_loss: torch.Tensor | None = None
+    quantile_loss: torch.Tensor | None = None
+    horizon_loss: torch.Tensor | None = None
+
+
 class Qwen3VLForConditionalGeneration(BaseComposeModel):
     config: Qwen3VLBaseConfig
 
@@ -139,18 +145,18 @@ class Qwen3VLForConditionalGeneration(BaseComposeModel):
         return special_visual_mask, visual_features, deepstack_visual_embeds
 
     def get_ts_feature(self, ts_values, ts_lens, ts_channels, sr):
-        ts_embeds, ts_pad_mask = self.time_series(
+        ts_embeds, ts_pad_mask, ts_embeds_before_project = self.time_series(
             time_series_signals=ts_values,
             ts_channels=ts_channels,
             ts_lens=ts_lens,
             sr=sr)
-        return ts_embeds, ts_pad_mask
+        return ts_embeds, ts_pad_mask, ts_embeds_before_project
 
     def forward(
             self,
             seq_ctx: SequenceContext,
             loss_ctx: dict[str, CELossContext] | None = None
-    ) -> MoEModelOutputs:
+    ) -> Qwen3VLForConditionalGenerationModelOutputs:
         input_ids = seq_ctx.input_ids
         pixel_values = seq_ctx.pixel_values
         image_grid_thw = seq_ctx.image_grid_thw
@@ -214,7 +220,7 @@ class Qwen3VLForConditionalGeneration(BaseComposeModel):
         )
         time_series_signals = seq_ctx.time_series_signals
         if time_series_signals is not None:
-            ts_features, ts_pad_mask = self.get_ts_feature(time_series_signals, seq_ctx.ts_lens, seq_ctx.ts_channels, seq_ctx.ts_sr)  # [B, T, C], [B, T]
+            ts_features, ts_pad_mask, ts_embeds_before_project = self.get_ts_feature(time_series_signals, seq_ctx.ts_lens, seq_ctx.ts_channels, seq_ctx.ts_sr)  # [B, T, C], [B, T]
             ts_features = ts_features[~ts_pad_mask].to(inputs_embeds.device,
                                                        inputs_embeds.dtype)  # [num_valid_ts_tokens, C]
             B, N, C = inputs_embeds.shape
@@ -239,7 +245,7 @@ class Qwen3VLForConditionalGeneration(BaseComposeModel):
             fake_ts_lens = torch.tensor([147], device=input_ids.device)
             fake_ts_channels = torch.tensor([3], device=input_ids.device)
             fake_sr = torch.tensor([36], device=input_ids.device)
-            ts_features, _ = self.get_ts_feature(fake_time_series_signals, fake_ts_lens, fake_ts_channels, fake_sr)
+            ts_features, _, _ = self.get_ts_feature(fake_time_series_signals, fake_ts_lens, fake_ts_channels, fake_sr)
             inputs_embeds = inputs_embeds * 0.0 + ts_features.sum() * 0.0
 
             # NOTE: 一定不要原地覆盖，否则第二次 forward 会缺少数据
@@ -251,4 +257,50 @@ class Qwen3VLForConditionalGeneration(BaseComposeModel):
             lang_seq_ctx,
             loss_ctx
         )
-        return outputs
+
+        point_loss, quantile_loss, horizon_loss = None, None, None
+        if self.time_series_forecaster is not None and seq_ctx.ts_forecast_target_signals is not None:
+            history = []
+            if isinstance(time_series_signals, list):
+                history = time_series_signals
+            else:
+                for i in range(len(time_series_signals)):
+                    history.append(time_series_signals[i, :seq_ctx.ts_lens[i], :seq_ctx.ts_channels[i]])
+            last_hidden_state = outputs.hidden_states[-1].reshape(-1, outputs.hidden_states[-1].shape[-1])
+            llm_embedding_input, llm_embedding_lens = [], []
+            start = 0
+            for end in seq_ctx.ts_forecast_input_id_ends.tolist():
+                llm_embedding_input.append(last_hidden_state[start:end])
+                llm_embedding_lens.append(end - start)
+                start = end
+            llm_embedding_input = torch.nn.utils.rnn.pad_sequence(llm_embedding_input, batch_first=True)
+            llm_embedding_lens = torch.tensor(llm_embedding_lens, device=llm_embedding_input.device)
+            llm_embedding_mask = torch.arange(llm_embedding_input.shape[1], device=llm_embedding_input.device) < llm_embedding_lens.unsqueeze(1)
+
+            ts_forecaster_outputs = self.time_series_forecaster(
+                history=history,
+                llm_embedding_input=llm_embedding_input,
+                ts_encoder_embedding_input=ts_embeds_before_project,
+                llm_embedding_mask=llm_embedding_mask,
+                ts_encoder_embedding_mask=~ts_pad_mask,
+                gt_ts=seq_ctx.ts_forecast_target_signals,
+            )
+            point_loss = ts_forecaster_outputs.get("point_loss")
+            quantile_loss = ts_forecaster_outputs.get("quantile_loss")
+            horizon_loss = ts_forecaster_outputs.get("horizon_loss")
+
+        return Qwen3VLForConditionalGenerationModelOutputs(
+            hidden_states=outputs.hidden_states,
+            logits=outputs.logits,
+            loss=outputs.loss,
+            extra_info=outputs.extra_info,
+            router_logits=outputs.router_logits,
+            router_weights=outputs.router_weights,
+            balancing_loss=outputs.balancing_loss,
+            z_loss=outputs.z_loss,
+            tokens_per_expert_global=outputs.tokens_per_expert_global,
+            mtp_loss=outputs.mtp_loss,
+            point_loss=point_loss,
+            quantile_loss=quantile_loss,
+            horizon_loss=horizon_loss,
+        )

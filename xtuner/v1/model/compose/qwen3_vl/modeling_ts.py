@@ -121,11 +121,11 @@ class Qwen3VLTimeSeriesModel(BaseModel):
                 ts_lens: Optional[torch.Tensor] = None,
                 ts_channels: Optional[torch.Tensor] = None,
                 sr: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, torch.Tensor]:
-        ts_embeds, ts_pad_mask = self.time_series(
+        ts_embeds, ts_pad_mask, *extra = self.time_series(
             time_series_signals,
             ts_lens=ts_lens,
             channels=ts_channels,
             sr=sr
         )
-        return ts_embeds, ts_pad_mask
-
+        ts_embeds_before_project = extra[0] if extra else None
+        return ts_embeds, ts_pad_mask, ts_embeds_before_project

@@ -270,17 +270,17 @@ def build_ts_transform(do_normalize=True, do_truncate=True, max_len=240000):
             ts_tensor = ts_tensor.to(torch.bfloat16)
 
             if do_truncate:
-                if len(ts_tensor) > 240000:  # truncate to 240k to avoid oom
-                    ts_tensor = ts_tensor[:240000, :]
+                if len(ts_tensor) > max_len:  # truncate to max_len to avoid oom
+                    ts_tensor = ts_tensor[:max_len, :]
 
             if len(ts_tensor.size()) == 1:
                 ts_tensor = ts_tensor.unsqueeze(-1)
 
             ts_len = ts_tensor.size(0)
+            if isinstance(sr, list):
+                sr = sr[0] # remove list
             if sr is None or sr == 0:  # if no sr provided
                 sr = ts_len / 4
-            else:
-                sr = sr[0]  # remove list
 
             return ts_tensor, torch.tensor(ts_len), torch.tensor(sr)
 
@@ -321,11 +321,23 @@ class Qwen3VLTokenizeFunction(BaseMLLMTokenizeFunction):
         hash: str | None = None,
         add_eos_token: bool = True,  # for mllm pretrain
         add_bos_token: bool = False,  # for mllm pretrain
+        ts_signals_do_normalize: bool = True,
+        ts_signals_do_truncate: bool = True,
+        ts_signals_max_len: int = 240000,
+        ts_subsampling_new: bool = False,
+        ts_subsampling_chunk_size: int = 12800,
+        ts_subsampling_num_qformer_query: int = 2,
     ):
         self.oss_loader = None
         self.debug = debug
         self.oss_time_log_thr = oss_time_log_thr
         self.enable_3d_rope = enable_3d_rope
+        self.ts_signals_do_normalize = ts_signals_do_normalize
+        self.ts_signals_do_truncate = ts_signals_do_truncate
+        self.ts_signals_max_len = ts_signals_max_len
+        self.ts_subsampling_new = ts_subsampling_new
+        self.ts_subsampling_chunk_size = ts_subsampling_chunk_size
+        self.ts_subsampling_num_qformer_query = ts_subsampling_num_qformer_query
 
         if oss_loader_cfg is not None:
             self.oss_loader = Qwen3VLOSSLoader(
@@ -430,7 +442,7 @@ class Qwen3VLTokenizeFunction(BaseMLLMTokenizeFunction):
         )
 
     def _get_ts_transform(self):
-        transform = build_ts_transform()
+        transform = build_ts_transform(self.ts_signals_do_normalize, self.ts_signals_do_truncate, self.ts_signals_max_len)
         return transform
 
     def _truncated_data_item(
@@ -456,10 +468,21 @@ class Qwen3VLTokenizeFunction(BaseMLLMTokenizeFunction):
         transform = self._get_ts_transform()
         _, ts_len, sampling_rate = transform(self._time_series_path, self._time_series_sampling_rate)
 
-        stride = torch.floor(160 / ((1 + torch.exp(-sampling_rate / 100)) ** 6))
-        patch_size = stride * 2
-        embed_length = (torch.ceil((ts_len - patch_size) / stride) + 1).long()
-        num_ts_tokens = (embed_length // 2 + 1) // 2
+        if not self.ts_subsampling_new:
+            stride = torch.floor(160 / ((1 + torch.exp(-sampling_rate / 100)) ** 6))
+            patch_size = stride * 2
+            embed_length = (torch.ceil((ts_len - patch_size) / stride) + 1).long()
+            num_ts_tokens = (embed_length // 2 + 1) // 2
+        else:
+            chunk_size, num_qformer_query = self.ts_subsampling_chunk_size, self.ts_subsampling_num_qformer_query
+            chunk_num = ts_len // chunk_size
+            tail_len = ts_len - chunk_num * chunk_size
+            subrate = torch.clamp(ts_len / 500, min=1.0)
+            stride = subrate * num_qformer_query
+            patch_size = torch.ceil(stride)
+            num_ts_tokens = (chunk_num * ((torch.ceil((chunk_size - patch_size) / stride + 1) * num_qformer_query + 1) // 2)
+                             + (torch.ceil((tail_len - patch_size) / stride + 1) * num_qformer_query + 1) // 2).long()
+
 
         # 特殊处理
         for _message in data_item["messages"]:
@@ -488,10 +511,26 @@ class Qwen3VLTokenizeFunction(BaseMLLMTokenizeFunction):
         self._time_series_path = [os.path.join(media_root, i) for i in self._time_series_path]
         ts_values, ts_len, sampling_rate = transform(self._time_series_path, self._time_series_sampling_rate)
 
-        stride = torch.floor(160 / ((1 + torch.exp(-sampling_rate / 100)) ** 6))
-        patch_size = stride * 2
-        embed_length = (torch.ceil((ts_len - patch_size) / stride) + 1).long()
-        num_ts_tokens = (embed_length // 2 + 1) // 2
+        ts_forecast_target_dict = {}
+        if self._time_series_forecast_target_path:
+            self._time_series_forecast_target_path = [os.path.join(media_root, i) for i in self._time_series_forecast_target_path]
+            ts_forecast_target_signals, _, _ = transform(self._time_series_forecast_target_path, self._time_series_sampling_rate)
+            ts_forecast_target_dict["ts_forecast_target_signals"] = ts_forecast_target_signals
+
+        if not self.ts_subsampling_new:
+            stride = torch.floor(160 / ((1 + torch.exp(-sampling_rate / 100)) ** 6))
+            patch_size = stride * 2
+            embed_length = (torch.ceil((ts_len - patch_size) / stride) + 1).long()
+            num_ts_tokens = (embed_length // 2 + 1) // 2
+        else:
+            chunk_size, num_qformer_query = self.ts_subsampling_chunk_size, self.ts_subsampling_num_qformer_query
+            chunk_num = ts_len // chunk_size
+            tail_len = ts_len - chunk_num * chunk_size
+            subrate = torch.clamp(ts_len / 500, min=1.0)
+            stride = subrate * num_qformer_query
+            patch_size = torch.ceil(stride)
+            num_ts_tokens = (chunk_num * ((torch.ceil((chunk_size - patch_size) / stride + 1) * num_qformer_query + 1) // 2)
+                             + (torch.ceil((tail_len - patch_size) / stride + 1) * num_qformer_query + 1) // 2).long()
 
         # 特殊处理
         for _message in data_item["messages"]:
@@ -518,6 +557,7 @@ class Qwen3VLTokenizeFunction(BaseMLLMTokenizeFunction):
             num_tokens=len(input_ids),
             num_img_tokens=[0],
             num_imgs=[0],
+            **ts_forecast_target_dict,
         )
         return ret
 
@@ -1069,6 +1109,13 @@ class Qwen3VLTokenizeFnConfig(BaseMLLMTokenizeFnConfig):
     # it's helpful to add labels to the images and videos for better reference.
     add_vision_id: bool = True
 
+    ts_signals_do_normalize: bool = True
+    ts_signals_do_truncate: bool = True
+    ts_signals_max_len: int = 240000
+    ts_subsampling_new: bool = False
+    ts_subsampling_chunk_size: int = 12800
+    ts_subsampling_num_qformer_query: int = 2
+
     def build(
         self, tokenizer, tokenizer_hash: str | None = None, anno_name: str = "", **kwargs
     ) -> Qwen3VLTokenizeFunction:
@@ -1097,4 +1144,10 @@ class Qwen3VLTokenizeFnConfig(BaseMLLMTokenizeFnConfig):
             oss_time_log_thr=self.oss_time_log_thr,
             add_eos_token=self.add_eos_token,  # for mllm pretrain
             add_bos_token=self.add_bos_token,  # for mllm pretrain
+            ts_signals_do_normalize=self.ts_signals_do_normalize,
+            ts_signals_do_truncate=self.ts_signals_do_truncate,
+            ts_signals_max_len=self.ts_signals_max_len,
+            ts_subsampling_new=self.ts_subsampling_new,
+            ts_subsampling_chunk_size=self.ts_subsampling_chunk_size,
+            ts_subsampling_num_qformer_query=self.ts_subsampling_num_qformer_query,
         )

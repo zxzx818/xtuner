@@ -299,23 +299,18 @@ def qwen3_vl_sft_collator(
                 f"position_ids length {position_ids.shape[-1]} != input_ids length {seq_ctx.input_ids.shape[-1]}"
             )
 
+        time_series_signals = []
         ts_lens = []
         ts_channels = []
         ts_sr = []
         for i in instance:
             if "time_series_signals" in i:
+                time_series_signals.append(i["time_series_signals"])
                 ts_lens.append(i["ts_len"])
                 ts_channels.append(i["time_series_signals"].shape[1])
                 ts_sr.append(i["ts_sr"])
 
         if ts_lens:
-            batch_size = len(ts_lens)
-            max_len, max_channel = max(ts_lens), max(ts_channels)
-            device = instance[0]["time_series_signals"].device
-            dtype = instance[0]["time_series_signals"].dtype
-            time_series_signals = torch.zeros(batch_size, max_len, max_channel, device=device, dtype=dtype)
-            for i, instance_ in enumerate(instance):
-                time_series_signals[i, :ts_lens[i], :ts_channels[i]] = instance_["time_series_signals"]
             ts_lens = torch.tensor(ts_lens)
             ts_channels = torch.tensor(ts_channels)
             sr = torch.tensor(ts_sr)
@@ -329,6 +324,20 @@ def qwen3_vl_sft_collator(
         seq_ctx.ts_channels = ts_channels
         seq_ctx.ts_sr = sr
         seq_ctx.time_series_signals = time_series_signals
+
+        ts_forecast_target_signals = []
+        ts_forecast_input_id_ends = []
+        if "ts_forecast_target_signals" in instance[0]:
+            for i, _instance in enumerate(instance):
+                ts_forecast_target_signals.append(_instance["ts_forecast_target_signals"])
+                ts_forecast_input_id_ends.append(seq_ctx.cu_seq_lens_q[i + 1])
+            ts_forecast_input_id_ends = torch.tensor(ts_forecast_input_id_ends)
+        else:
+            ts_forecast_target_signals = None
+            ts_forecast_input_id_ends = None
+
+        seq_ctx.ts_forecast_target_signals = ts_forecast_target_signals
+        seq_ctx.ts_forecast_input_id_ends = ts_forecast_input_id_ends
 
         ret.append(
             {

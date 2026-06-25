@@ -3,6 +3,7 @@ from xtuner.v1.model.moe.qwen3_5_text import Qwen3_5_VLTextMoE35BA3BConfig
 from xtuner.v1.utils import get_logger
 
 from ..qwen3_vl.qwen3_vl_config import Qwen3VLBaseConfig, Qwen3VLProjectorConfig, Qwen3VLVisionConfig
+from ..qwen3_vl.modeling_ts_forecaster import InternS2PreviewTimeSeriesForecasterConfig
 
 
 logger = get_logger()
@@ -35,3 +36,5 @@ class Qwen3_5_VLMoE35BA3Config(Qwen3_5_BaseConfig):
 class Qwen3_5TimeSeriesMoE35BA3Config(Qwen3_5_VLMoE35BA3Config):
     time_series_encoder_path: str | None = None
     ts_token_id: int = 248093
+    time_series_forecaster_config: InternS2PreviewTimeSeriesForecasterConfig = InternS2PreviewTimeSeriesForecasterConfig()
+    enable_ts_forecast: bool = False
