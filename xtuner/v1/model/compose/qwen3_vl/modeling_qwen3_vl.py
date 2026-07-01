@@ -220,7 +220,15 @@ class Qwen3VLForConditionalGeneration(BaseComposeModel):
         )
         time_series_signals = seq_ctx.time_series_signals
         if time_series_signals is not None:
-            ts_features, ts_pad_mask, ts_embeds_before_project = self.get_ts_feature(time_series_signals, seq_ctx.ts_lens, seq_ctx.ts_channels, seq_ctx.ts_sr)  # [B, T, C], [B, T]
+            if self.config.ts_forecast_covariate_as_extra_input and seq_ctx.ts_forecast_target_signals is not None:
+                time_series_signals_for_ts_encoder = []
+                for time_series_signal, ts_forecast_target_signal in zip(time_series_signals, seq_ctx.ts_forecast_target_signals):
+                    time_series_signal_for_ts_encoder = torch.cat([time_series_signal, ts_forecast_target_signal])
+                    time_series_signal_for_ts_encoder[-ts_forecast_target_signal.shape[0]:, 0] = 0
+                    time_series_signals_for_ts_encoder.append(time_series_signal_for_ts_encoder)
+            else:
+                time_series_signals_for_ts_encoder = time_series_signals
+            ts_features, ts_pad_mask, ts_embeds_before_project = self.get_ts_feature(time_series_signals_for_ts_encoder, seq_ctx.ts_lens, seq_ctx.ts_channels, seq_ctx.ts_sr)  # [B, T, C], [B, T]
             ts_features = ts_features[~ts_pad_mask].to(inputs_embeds.device,
                                                        inputs_embeds.dtype)  # [num_valid_ts_tokens, C]
             B, N, C = inputs_embeds.shape
@@ -260,6 +268,9 @@ class Qwen3VLForConditionalGeneration(BaseComposeModel):
 
         point_loss, quantile_loss, horizon_loss = None, None, None
         if self.time_series_forecaster is not None and seq_ctx.ts_forecast_target_signals is not None:
+            ts_forecast_target_signals = seq_ctx.ts_forecast_target_signals
+            if self.config.ts_forecast_covariate_as_extra_input:
+                ts_forecast_target_signals = [ts_forecast_target_signal[:, 0:1] for ts_forecast_target_signal in ts_forecast_target_signals]
             history = []
             if isinstance(time_series_signals, list):
                 history = time_series_signals
@@ -283,7 +294,7 @@ class Qwen3VLForConditionalGeneration(BaseComposeModel):
                 ts_encoder_embedding_input=ts_embeds_before_project,
                 llm_embedding_mask=llm_embedding_mask,
                 ts_encoder_embedding_mask=~ts_pad_mask,
-                gt_ts=seq_ctx.ts_forecast_target_signals,
+                gt_ts=ts_forecast_target_signals,
             )
             point_loss = ts_forecaster_outputs.get("point_loss")
             quantile_loss = ts_forecaster_outputs.get("quantile_loss")

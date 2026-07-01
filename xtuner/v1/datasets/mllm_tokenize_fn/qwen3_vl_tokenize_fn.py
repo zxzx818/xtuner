@@ -327,6 +327,7 @@ class Qwen3VLTokenizeFunction(BaseMLLMTokenizeFunction):
         ts_subsampling_new: bool = False,
         ts_subsampling_chunk_size: int = 12800,
         ts_subsampling_num_qformer_query: int = 2,
+        ts_forecast_covariate_as_extra_input: bool = False,
     ):
         self.oss_loader = None
         self.debug = debug
@@ -338,6 +339,7 @@ class Qwen3VLTokenizeFunction(BaseMLLMTokenizeFunction):
         self.ts_subsampling_new = ts_subsampling_new
         self.ts_subsampling_chunk_size = ts_subsampling_chunk_size
         self.ts_subsampling_num_qformer_query = ts_subsampling_num_qformer_query
+        self.ts_forecast_covariate_as_extra_input = ts_forecast_covariate_as_extra_input
 
         if oss_loader_cfg is not None:
             self.oss_loader = Qwen3VLOSSLoader(
@@ -414,6 +416,13 @@ class Qwen3VLTokenizeFunction(BaseMLLMTokenizeFunction):
             f"_{self.video_processor.size['longest_edge']}_{self.video_processor.min_frames}_"
             f"{self.video_processor.max_frames}_{self.video_processor.fps}_{self.enable_3d_rope}_"
             f"{self.add_vision_id}_{system_message}_{max_length}_{self.rand_video_max_frames}"
+            f"_ts_norm:{self.ts_signals_do_normalize}"
+            f"_ts_trunc:{self.ts_signals_do_truncate}"
+            f"_ts_max:{self.ts_signals_max_len}"
+            f"_ts_sub_new:{self.ts_subsampling_new}"
+            f"_ts_sub_chunk:{self.ts_subsampling_chunk_size}"
+            f"_ts_sub_q:{self.ts_subsampling_num_qformer_query}"
+            f"_ts_cov_extra:{self.ts_forecast_covariate_as_extra_input}"
         )
 
         self.size = SimpleNamespace(**self.video_processor.size)
@@ -467,6 +476,9 @@ class Qwen3VLTokenizeFunction(BaseMLLMTokenizeFunction):
     def calc_num_tokens_time_series_get_item(self, data_item) -> CacheItem:
         transform = self._get_ts_transform()
         _, ts_len, sampling_rate = transform(self._time_series_path, self._time_series_sampling_rate)
+        if self.ts_forecast_covariate_as_extra_input and self._time_series_forecast_target_path:
+            _, ts_forecast_target_len, _ = transform(self._time_series_forecast_target_path, self._time_series_sampling_rate)
+            ts_len += ts_forecast_target_len
 
         if not self.ts_subsampling_new:
             stride = torch.floor(160 / ((1 + torch.exp(-sampling_rate / 100)) ** 6))
@@ -514,8 +526,10 @@ class Qwen3VLTokenizeFunction(BaseMLLMTokenizeFunction):
         ts_forecast_target_dict = {}
         if self._time_series_forecast_target_path:
             self._time_series_forecast_target_path = [os.path.join(media_root, i) for i in self._time_series_forecast_target_path]
-            ts_forecast_target_signals, _, _ = transform(self._time_series_forecast_target_path, self._time_series_sampling_rate)
+            ts_forecast_target_signals, ts_forecast_target_len, _ = transform(self._time_series_forecast_target_path, self._time_series_sampling_rate)
             ts_forecast_target_dict["ts_forecast_target_signals"] = ts_forecast_target_signals
+            if self.ts_forecast_covariate_as_extra_input:
+                ts_len += ts_forecast_target_len
 
         if not self.ts_subsampling_new:
             stride = torch.floor(160 / ((1 + torch.exp(-sampling_rate / 100)) ** 6))
@@ -1115,6 +1129,7 @@ class Qwen3VLTokenizeFnConfig(BaseMLLMTokenizeFnConfig):
     ts_subsampling_new: bool = False
     ts_subsampling_chunk_size: int = 12800
     ts_subsampling_num_qformer_query: int = 2
+    ts_forecast_covariate_as_extra_input: bool = False
 
     def build(
         self, tokenizer, tokenizer_hash: str | None = None, anno_name: str = "", **kwargs
@@ -1150,4 +1165,5 @@ class Qwen3VLTokenizeFnConfig(BaseMLLMTokenizeFnConfig):
             ts_subsampling_new=self.ts_subsampling_new,
             ts_subsampling_chunk_size=self.ts_subsampling_chunk_size,
             ts_subsampling_num_qformer_query=self.ts_subsampling_num_qformer_query,
+            ts_forecast_covariate_as_extra_input=self.ts_forecast_covariate_as_extra_input,
         )
