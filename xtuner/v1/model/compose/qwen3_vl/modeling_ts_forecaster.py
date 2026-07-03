@@ -73,6 +73,15 @@ class InternS2PreviewTimeSeriesForecasterConfig(XTunerBaseModelConfig):
     point_loss_weight: float = 1.0
     quantile_loss_weight: float = 1.0
     horizon_loss_weight: float = 1.0
+    future_covariate_injection: str = "none"
+    future_covariate_target_channel_idx: int = 0
+    future_covariate_patch_len: int = 32
+    future_covariate_queries_per_patch: int = 4
+    future_covariate_hidden_dim: int = 1280
+    future_covariate_num_heads: int = 8
+    future_covariate_num_layers: int = 1
+    future_covariate_dropout: float = 0.0
+    future_covariate_max_horizon: int = 1024
 
     def build(self):
         return InternS2PreviewTimeSeriesForecaster(self)
@@ -584,6 +593,7 @@ class Transformer(nn.Module):
         patch_mask: torch.Tensor,
         decode_cache: DecodeCache | None = None,
         cross_kv: torch.Tensor | None = None,
+        cross_kv_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, DecodeCache | None]:
         attn_output, decode_cache = self.attn(
             inputs_q=self.pre_attn_ln(input_embeddings),
@@ -596,6 +606,7 @@ class Transformer(nn.Module):
             cross_out = self.cross_attn(
                 self.cross_attn_ln(attn_output),
                 kv=cross_kv,
+                kv_mask=cross_kv_mask,
             )
             if self.cross_attn_gate is not None:
                 cross_out = torch.tanh(self.cross_attn_gate) * cross_out
@@ -873,6 +884,158 @@ class Aligner(nn.Module):
         return self.horizon_head(pooled).squeeze(-1).to(dtype=torch.float32)
 
 
+class FutureCovariateEncoder(nn.Module):
+    """Encode future covariates into patch-level KV tokens for Forecaster cross-attn.
+
+    The first projection is shared across channels, so the module does not depend
+    on a fixed number of covariate channels. For each future patch, learned query
+    tokens pool all covariate channels into a small set of patch-local tokens.
+    """
+
+    def __init__(self, config: "InternS2PreviewTimeSeriesForecasterConfig"):
+        super().__init__()
+        self.patch_len = int(config.future_covariate_patch_len)
+        self.queries_per_patch = int(config.future_covariate_queries_per_patch)
+        self.hidden_dim = int(config.future_covariate_hidden_dim)
+        self.output_dim = int(config.qformer_hidden_dim)
+        self.max_horizon = int(config.future_covariate_max_horizon)
+        self.max_patches = math.ceil(self.max_horizon / self.patch_len)
+        self.max_tokens = self.max_patches * self.queries_per_patch
+
+        if self.patch_len <= 0:
+            raise ValueError(f"future_covariate_patch_len must be positive, got {self.patch_len}")
+        if self.queries_per_patch <= 0:
+            raise ValueError(
+                f"future_covariate_queries_per_patch must be positive, got {self.queries_per_patch}"
+            )
+        if self.hidden_dim <= 0:
+            raise ValueError(f"future_covariate_hidden_dim must be positive, got {self.hidden_dim}")
+        if self.max_horizon <= 0:
+            raise ValueError(f"future_covariate_max_horizon must be positive, got {self.max_horizon}")
+
+        self.channel_patch_proj = nn.Sequential(
+            nn.LayerNorm(self.patch_len),
+            nn.Linear(self.patch_len, self.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
+        self.patch_queries = nn.Parameter(torch.empty(self.queries_per_patch, self.hidden_dim))
+        nn.init.trunc_normal_(self.patch_queries, std=0.02)
+        self.channel_attn = nn.MultiheadAttention(
+            self.hidden_dim,
+            int(config.future_covariate_num_heads),
+            dropout=float(config.future_covariate_dropout),
+            batch_first=True,
+        )
+        self.position_embedding = nn.Parameter(torch.zeros(1, self.max_tokens, self.hidden_dim))
+        nn.init.trunc_normal_(self.position_embedding, std=0.02)
+
+        if int(config.future_covariate_num_layers) > 0:
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=self.hidden_dim,
+                nhead=int(config.future_covariate_num_heads),
+                dim_feedforward=self.hidden_dim * 4,
+                dropout=float(config.future_covariate_dropout),
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            self.token_mixer = nn.TransformerEncoder(
+                encoder_layer,
+                num_layers=int(config.future_covariate_num_layers),
+            )
+        else:
+            self.token_mixer = None
+
+        self.output_proj = (
+            nn.Identity()
+            if self.hidden_dim == self.output_dim
+            else nn.Linear(self.hidden_dim, self.output_dim)
+        )
+
+    def _encode_one(self, covariates: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        param = self.patch_queries
+        covariates = covariates.to(device=param.device, dtype=param.dtype)
+        if covariates.dim() != 2:
+            raise ValueError(f"future covariates must be 2D (H, C), got {tuple(covariates.shape)}")
+
+        horizon, channels = covariates.shape
+        if horizon > self.max_horizon:
+            raise ValueError(
+                "Future covariate horizon exceeds configured maximum:"
+                f" {horizon} > {self.max_horizon}"
+            )
+
+        num_patches = max(1, math.ceil(max(horizon, 1) / self.patch_len))
+        num_tokens = num_patches * self.queries_per_patch
+        if channels == 0 or horizon == 0:
+            tokens = covariates.new_zeros(num_tokens, self.hidden_dim)
+            mask = torch.ones(num_tokens, dtype=torch.bool, device=param.device)
+            return tokens, mask
+
+        pad_len = num_patches * self.patch_len - horizon
+        if pad_len > 0:
+            covariates = torch.cat(
+                [covariates, covariates.new_zeros(pad_len, channels)],
+                dim=0,
+            )
+        patches = covariates.reshape(num_patches, self.patch_len, channels).transpose(1, 2)
+        channel_tokens = self.channel_patch_proj(patches)
+        queries = self.patch_queries.unsqueeze(0).expand(num_patches, -1, -1)
+        pooled, _ = self.channel_attn(
+            queries,
+            channel_tokens,
+            channel_tokens,
+            need_weights=False,
+        )
+        tokens = pooled.reshape(num_tokens, self.hidden_dim)
+        mask = torch.zeros(num_tokens, dtype=torch.bool, device=param.device)
+        return tokens, mask
+
+    def forward(self, future_covariates: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        if not future_covariates:
+            raise ValueError("future_covariates must contain one tensor per sample")
+
+        encoded = [self._encode_one(covariates) for covariates in future_covariates]
+        max_tokens = max(tokens.shape[0] for tokens, _ in encoded)
+        if max_tokens > self.max_tokens:
+            raise ValueError(
+                "Future covariate token count exceeds configured maximum:"
+                f" {max_tokens} > {self.max_tokens}"
+            )
+
+        param = self.patch_queries
+        batch_tokens = []
+        batch_mask = []
+        for tokens, mask in encoded:
+            pad_tokens = max_tokens - tokens.shape[0]
+            if pad_tokens > 0:
+                tokens = torch.cat(
+                    [tokens, tokens.new_zeros(pad_tokens, tokens.shape[-1])],
+                    dim=0,
+                )
+                mask = torch.cat(
+                    [mask, torch.ones(pad_tokens, dtype=torch.bool, device=param.device)],
+                    dim=0,
+                )
+            batch_tokens.append(tokens)
+            batch_mask.append(mask)
+
+        tokens = torch.stack(batch_tokens, dim=0)
+        mask = torch.stack(batch_mask, dim=0)
+        tokens = tokens + self.position_embedding[:, :max_tokens].to(dtype=tokens.dtype, device=tokens.device)
+
+        if self.token_mixer is not None:
+            safe_mask = mask.clone()
+            fully_masked = safe_mask.all(dim=1)
+            if fully_masked.any():
+                safe_mask[fully_masked, 0] = False
+            tokens = self.token_mixer(tokens, src_key_padding_mask=safe_mask)
+            tokens = tokens.masked_fill(mask.unsqueeze(-1), 0.0)
+
+        return self.output_proj(tokens), mask
+
+
 class ForecasterBackbone(nn.Module):
     """Forecaster 2.5 with 200M parameters (cross-attention capable)."""
 
@@ -944,6 +1107,7 @@ class ForecasterBackbone(nn.Module):
         masks: torch.Tensor,
         decode_caches: list | None = None,
         cross_kv: torch.Tensor | None = None,
+        cross_kv_mask: torch.Tensor | None = None,
     ):
         """Forward pass — history-only path with cross-attention injection."""
         if cross_kv is not None and not getattr(self, "use_cross_attn", False):
@@ -962,6 +1126,8 @@ class ForecasterBackbone(nn.Module):
 
         if cross_kv is not None:
             cross_kv = cross_kv.to(device=input_embeddings.device, dtype=input_embeddings.dtype)
+        if cross_kv_mask is not None:
+            cross_kv_mask = cross_kv_mask.to(device=input_embeddings.device, dtype=torch.bool)
 
         if decode_caches is None:
             decode_caches = [None] * self.x
@@ -976,6 +1142,7 @@ class ForecasterBackbone(nn.Module):
                 token_masks,
                 decode_caches[i],
                 cross_kv=cross_kv,
+                cross_kv_mask=cross_kv_mask,
             )
             new_decode_caches.append(new_cache)
 
@@ -1013,7 +1180,17 @@ class InternS2PreviewTimeSeriesForecaster(BaseModel):
     def __init__(self, config: InternS2PreviewTimeSeriesForecasterConfig):
         super().__init__(config)
 
+        if config.future_covariate_injection not in ("none", "forecaster_cross_attn"):
+            raise ValueError(
+                "future_covariate_injection must be one of"
+                f" ('none', 'forecaster_cross_attn'), got {config.future_covariate_injection!r}"
+            )
         self.aligner = Aligner(config)
+        self.future_covariate_encoder = (
+            FutureCovariateEncoder(config)
+            if config.future_covariate_injection == "forecaster_cross_attn"
+            else None
+        )
         self.forecaster = ForecasterBackbone(
             use_cross_attn=True,
             cross_attn_kv_dim=config.cross_attn_kv_dim,
@@ -1131,13 +1308,20 @@ class InternS2PreviewTimeSeriesForecaster(BaseModel):
         return ((value + multiple - 1) // multiple) * multiple
 
     @staticmethod
-    def _flatten_channelwise(history: list[torch.Tensor], ctx: torch.Tensor, gt_ts: list[torch.Tensor] | None = None):
+    def _flatten_channelwise(
+        history: list[torch.Tensor],
+        ctx: torch.Tensor,
+        gt_ts: list[torch.Tensor] | None = None,
+        ctx_mask: torch.Tensor | None = None,
+        target_channel_idx: int | None = None,
+    ):
         """Split each (T, C) history into C single-channel series; replicate the
         per-sample cross-attn context once per channel (Forecaster forecasts a single
         univariate series at a time)."""
         channel_counts = []
         flattened_inputs = []
         flattened_prefix = []
+        flattened_prefix_mask = [] if ctx_mask is not None else None
         flattened_gt = [] if gt_ts is not None else None
         for sample_idx, ts in enumerate(history):
             if ts.dim() != 2:
@@ -1154,17 +1338,19 @@ class InternS2PreviewTimeSeriesForecaster(BaseModel):
                     raise ValueError(f"Each gt_ts must be 2D (T, C), got shape {tuple(gt.shape)}")
                 if gt.shape[1] == channels:
                     channel_pairs = [(channel_idx, channel_idx) for channel_idx in range(channels)]
-                elif gt.shape[1] == 1 and channels == 5:
-                    target_channel_idx = 3  # For FinMultiTime data, "channel_detail": ["Open", "High", "Low", "Close", "Volume"] and forecast "Close" price, so use channel index 3 as the target. This can be made configurable if needed.
+                elif gt.shape[1] == 1 and target_channel_idx is not None:
                     if target_channel_idx < 0 or target_channel_idx >= channels:
                         raise ValueError(
-                            "forecast_target_input_channel_idx is out of range for input channels:"
+                            "forecast target channel index is out of range for input channels:"
                             f" idx={target_channel_idx}, channels={channels}"
                         )
                     channel_pairs = [(target_channel_idx, 0)]
+                elif gt.shape[1] == 1 and channels == 5:
+                    input_target_channel_idx = 3  # For FinMultiTime data, "channel_detail": ["Open", "High", "Low", "Close", "Volume"] and forecast "Close" price, so use channel index 3 as the target. This can be made configurable if needed.
+                    channel_pairs = [(input_target_channel_idx, 0)]
                 elif gt.shape[1] == 1 and channels == 45:
-                    target_channel_idx = 0  # For NewElec data, "channel_detail": ["target", "weather_0", ..., "weather_43"]: channel 0 is the electricity load to forecast, channels 1..44 are weather covariates. Only channel 0 drives the TimesFM backbone; the full 45 channels still feed the TS encoder.
-                    channel_pairs = [(target_channel_idx, 0)]
+                    input_target_channel_idx = 0  # For NewElec data, "channel_detail": ["target", "weather_0", ..., "weather_43"]: channel 0 is the electricity load to forecast, channels 1..44 are weather covariates. Only channel 0 drives the TimesFM backbone; the full 45 channels still feed the TS encoder.
+                    channel_pairs = [(input_target_channel_idx, 0)]
                 else:
                     raise ValueError(
                         "Input/target channel mismatch is not supported:"
@@ -1177,9 +1363,11 @@ class InternS2PreviewTimeSeriesForecaster(BaseModel):
             for input_channel_idx, gt_channel_idx in channel_pairs:
                 flattened_inputs.append(ts[:, input_channel_idx])
                 flattened_prefix.append(ctx[sample_idx])
+                if flattened_prefix_mask is not None:
+                    flattened_prefix_mask.append(ctx_mask[sample_idx])
                 if flattened_gt is not None:
                     flattened_gt.append(gt[:, gt_channel_idx])
-        return channel_counts, flattened_inputs, flattened_prefix, flattened_gt
+        return channel_counts, flattened_inputs, flattened_prefix, flattened_prefix_mask, flattened_gt
 
     @staticmethod
     def revin(
@@ -1250,6 +1438,7 @@ class InternS2PreviewTimeSeriesForecaster(BaseModel):
         llm_embedding_mask: torch.Tensor | None = None,
         ts_encoder_embedding_mask: torch.Tensor | None = None,
         gt_ts: list[torch.Tensor] | None = None,
+        future_covariates: list[torch.Tensor] | None = None,
         return_dict: bool | None = None,
     ):
         ctx, llm_chunk = self.aligner(
@@ -1258,6 +1447,24 @@ class InternS2PreviewTimeSeriesForecaster(BaseModel):
             llm_embedding_mask=llm_embedding_mask,
             ts_encoder_embedding_mask=ts_encoder_embedding_mask,
         )
+        ctx_mask = None
+        if self.future_covariate_encoder is not None:
+            if future_covariates is None:
+                raise ValueError(
+                    "future_covariates must be provided when future_covariate_injection="
+                    "'forecaster_cross_attn'"
+                )
+            if len(future_covariates) != ctx.shape[0]:
+                raise ValueError(
+                    "future_covariates batch size must match ctx batch size:"
+                    f" {len(future_covariates)} != {ctx.shape[0]}"
+                )
+            future_cov_tokens, future_cov_mask = self.future_covariate_encoder(future_covariates)
+            future_cov_tokens = future_cov_tokens.to(device=ctx.device, dtype=ctx.dtype)
+            future_cov_mask = future_cov_mask.to(device=ctx.device)
+            base_ctx_mask = torch.zeros(ctx.shape[:2], dtype=torch.bool, device=ctx.device)
+            ctx = torch.cat([ctx, future_cov_tokens], dim=1)
+            ctx_mask = torch.cat([base_ctx_mask, future_cov_mask], dim=1)
 
         horizon_loss = None
         if self.aligner.horizon_head is not None:
@@ -1273,7 +1480,18 @@ class InternS2PreviewTimeSeriesForecaster(BaseModel):
             # amplified long-horizon errors and hurt exact matching.
             horizon_loss = nn.functional.smooth_l1_loss(pred_horizon, gt_lengths_tensor)
 
-        channel_counts, flattened_inputs, flattened_prefix, flattened_gt = self._flatten_channelwise(history, ctx, gt_ts)
+        target_channel_idx = (
+            int(self.config.future_covariate_target_channel_idx)
+            if self.future_covariate_encoder is not None
+            else None
+        )
+        channel_counts, flattened_inputs, flattened_prefix, flattened_prefix_mask, flattened_gt = self._flatten_channelwise(
+            history,
+            ctx,
+            gt_ts,
+            ctx_mask=ctx_mask,
+            target_channel_idx=target_channel_idx,
+        )
 
         flattened_prefix = [p.to(dtype=torch.float32) for p in flattened_prefix]
 
@@ -1301,6 +1519,7 @@ class InternS2PreviewTimeSeriesForecaster(BaseModel):
         future_values = []
         future_valid_mask = []
         prefix_batch = [] if flattened_prefix is not None else None
+        prefix_batch_mask = [] if flattened_prefix_mask is not None else None
         gt_lengths = []
         for series_idx, (hist_ts, future_ts) in enumerate(zip(flattened_inputs, flattened_gt)):
             hist_ts = hist_ts.to(device=forecaster_device).reshape(-1)
@@ -1354,6 +1573,10 @@ class InternS2PreviewTimeSeriesForecaster(BaseModel):
             if prefix_batch is not None:
                 prefix_batch.append(
                     flattened_prefix[series_idx]
+                )
+            if prefix_batch_mask is not None:
+                prefix_batch_mask.append(
+                    flattened_prefix_mask[series_idx]
                 )
 
         full_inputs_t = torch.stack(full_inputs, dim=0)
@@ -1409,13 +1632,19 @@ class InternS2PreviewTimeSeriesForecaster(BaseModel):
         normed_inputs = torch.where(patched_masks, 0.0, normed_inputs)
 
         prefix_batch_t = None
+        prefix_batch_mask_t = None
         if prefix_batch is not None:
             prefix_batch_t = torch.stack(prefix_batch, dim=0).to(device=forecaster_device)
+        if prefix_batch_mask is not None:
+            prefix_batch_mask_t = torch.stack(prefix_batch_mask, dim=0).to(
+                device=forecaster_device, dtype=torch.bool
+            )
 
         (_, _, normed_outputs, normed_quantile_spread), _ = self.forecaster(
             normed_inputs,
             patched_masks,
             cross_kv=prefix_batch_t,
+            cross_kv_mask=prefix_batch_mask_t,
         )
 
         if getattr(self.config, "force_flip_invariance", False):
@@ -1423,6 +1652,7 @@ class InternS2PreviewTimeSeriesForecaster(BaseModel):
                 -normed_inputs,
                 patched_masks,
                 cross_kv=prefix_batch_t,
+                cross_kv_mask=prefix_batch_mask_t,
             )
             # Reshape to 4D so _flip_timesfm_quantile_order flips only the quantile dim,
             # not the entire flattened output_patch_len * num_quantiles dimension.

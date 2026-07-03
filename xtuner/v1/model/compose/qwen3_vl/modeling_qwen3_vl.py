@@ -219,12 +219,24 @@ class Qwen3VLForConditionalGeneration(BaseComposeModel):
             visual_pos_masks=visual_pos_masks,
         )
         time_series_signals = seq_ctx.time_series_signals
+        forecast_target_channel_idx = 0
+        if self.time_series_forecaster is not None:
+            forecast_target_channel_idx = int(
+                getattr(self.time_series_forecaster.config, "future_covariate_target_channel_idx", 0)
+            )
         if time_series_signals is not None:
             if self.config.ts_forecast_covariate_as_extra_input and seq_ctx.ts_forecast_target_signals is not None:
                 time_series_signals_for_ts_encoder = []
                 for time_series_signal, ts_forecast_target_signal in zip(time_series_signals, seq_ctx.ts_forecast_target_signals):
+                    if forecast_target_channel_idx < 0 or forecast_target_channel_idx >= ts_forecast_target_signal.shape[1]:
+                        raise ValueError(
+                            "future covariate target channel index is out of range for gt_ts:"
+                            f" idx={forecast_target_channel_idx}, channels={ts_forecast_target_signal.shape[1]}"
+                        )
                     time_series_signal_for_ts_encoder = torch.cat([time_series_signal, ts_forecast_target_signal])
-                    time_series_signal_for_ts_encoder[-ts_forecast_target_signal.shape[0]:, 0] = 0
+                    time_series_signal_for_ts_encoder[
+                        -ts_forecast_target_signal.shape[0]:, forecast_target_channel_idx
+                    ] = 0
                     time_series_signals_for_ts_encoder.append(time_series_signal_for_ts_encoder)
             else:
                 time_series_signals_for_ts_encoder = time_series_signals
@@ -269,8 +281,47 @@ class Qwen3VLForConditionalGeneration(BaseComposeModel):
         point_loss, quantile_loss, horizon_loss = None, None, None
         if self.time_series_forecaster is not None and seq_ctx.ts_forecast_target_signals is not None:
             ts_forecast_target_signals = seq_ctx.ts_forecast_target_signals
-            if self.config.ts_forecast_covariate_as_extra_input:
-                ts_forecast_target_signals = [ts_forecast_target_signal[:, 0:1] for ts_forecast_target_signal in ts_forecast_target_signals]
+            future_covariate_signals = None
+            use_future_covariate_cross_attn = (
+                getattr(self.time_series_forecaster.config, "future_covariate_injection", "none")
+                == "forecaster_cross_attn"
+            )
+            if use_future_covariate_cross_attn:
+                future_covariate_signals = []
+                target_signals = []
+                for ts_forecast_target_signal in ts_forecast_target_signals:
+                    if forecast_target_channel_idx < 0 or forecast_target_channel_idx >= ts_forecast_target_signal.shape[1]:
+                        raise ValueError(
+                            "future covariate target channel index is out of range for gt_ts:"
+                            f" idx={forecast_target_channel_idx}, channels={ts_forecast_target_signal.shape[1]}"
+                        )
+                    target_signals.append(
+                        ts_forecast_target_signal[:, forecast_target_channel_idx:forecast_target_channel_idx + 1]
+                    )
+                    future_covariate_signals.append(
+                        torch.cat(
+                            [
+                                ts_forecast_target_signal[:, :forecast_target_channel_idx],
+                                ts_forecast_target_signal[:, forecast_target_channel_idx + 1:],
+                            ],
+                            dim=1,
+                        )
+                    )
+                ts_forecast_target_signals = target_signals
+            elif self.config.ts_forecast_covariate_as_extra_input:
+                target_signals = []
+                for ts_forecast_target_signal in ts_forecast_target_signals:
+                    if forecast_target_channel_idx < 0 or forecast_target_channel_idx >= ts_forecast_target_signal.shape[1]:
+                        raise ValueError(
+                            "future covariate target channel index is out of range for gt_ts:"
+                            f" idx={forecast_target_channel_idx}, channels={ts_forecast_target_signal.shape[1]}"
+                        )
+                    target_signals.append(
+                        ts_forecast_target_signal[
+                            :, forecast_target_channel_idx:forecast_target_channel_idx + 1
+                        ]
+                    )
+                ts_forecast_target_signals = target_signals
             history = []
             if isinstance(time_series_signals, list):
                 history = time_series_signals
@@ -295,6 +346,7 @@ class Qwen3VLForConditionalGeneration(BaseComposeModel):
                 llm_embedding_mask=llm_embedding_mask,
                 ts_encoder_embedding_mask=~ts_pad_mask,
                 gt_ts=ts_forecast_target_signals,
+                future_covariates=future_covariate_signals,
             )
             point_loss = ts_forecaster_outputs.get("point_loss")
             quantile_loss = ts_forecaster_outputs.get("quantile_loss")
